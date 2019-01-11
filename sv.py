@@ -1,23 +1,51 @@
+import argparse
 import logging
 import socket
 import os
+import re
+import struct
+import subprocess
 import sys
+import time
 
 import multiprocessing
+from multiprocessing import forking
+from multiprocessing import reduction
 
 import eventlet
 import eventlet.wsgi
 
+from os_win import utilsfactory as os_win_utilsfactory
+
+# TODO: ditch pywin32
+import ntsecuritycon
+import pywintypes
+import win32api
+import win32con
+import win32event
+import win32file
+import win32pipe
+import win32security
+import winerror
+
 eventlet.monkey_patch(os=False)
 
-multiprocessing.allow_connection_pickling()
+# multiprocessing.allow_connection_pickling()
 
 LOG = logging.getLogger()
 
 EVENTLET_DEBUG = False
 BIND_ADDR = "127.0.0.1"
 BIND_PORT = 1234
-WORKER_COUNT = 2
+WORKER_COUNT = 1
+
+parser = argparse.ArgumentParser(
+    description='Helper publishing subunit test results.')
+parser.add_argument('--pipe-handle', required=False)
+
+
+args = parser.parse_args()
+
 
 def configure_logging(debug=True):
     log_level = logging.DEBUG if debug else logging.INFO
@@ -52,17 +80,74 @@ def listen(addr, family=socket.AF_INET, backlog=50):
     return sock
 
 
+class Win32ProcessLauncher(object):
+    def __init__(self):
+        self._processutils = os_win_utilsfactory.get_processutils()
+
+        self._workers = []
+        self._worker_job_handles = []
+        # TODO: should we add signal handlers?
+
+    def add_process(self, cmd):
+        LOG.info("Starting subprocess: %s", cmd)
+
+        worker = subprocess.Popen(cmd)
+        # import _subprocess
+        # _python_exe = os.path.join(sys.exec_prefix, 'python.exe')
+        # cmd = ' '.join('"%s"' % x for x in cmd)
+        # hp, ht, pid, tid = _subprocess.CreateProcess(
+        #         _python_exe, cmd, None, None, 1, 0, None, None, None
+        #         )
+        # ht.Close()
+        # import mock
+        # worker = mock.Mock(pid=pid)
+        try:
+            job_handle = self._processutils.kill_process_on_job_close(
+                worker.pid)
+        except Exception:
+            LOG.exception("Could not associate child process "
+                          "with a job, killing it.")
+            worker.kill()
+            raise
+
+        self._worker_job_handles.append(job_handle)
+        self._workers.append(worker)
+
+        return worker
+
+    def wait(self):
+        pids = [worker.pid for worker in self._workers]
+        if pids:
+            self._processutils.wait_for_multiple_processes(pids,
+                                                           wait_all=True)
+        # By sleeping here, we allow signal handlers to be executed.
+        time.sleep(0)
+
+
 class Server(object):
-    def __init__(self, app, worker_count=0):
+    _py_script_re = re.compile(r'.*\.py\w?$')
+
+    def __init__(self, app, worker_count=0, socket_handle=None):
         self._app = app
         self._worker_count = worker_count
-        self._workers = []
 
-        self._config_socket()
+        self._launcher = Win32ProcessLauncher()
+        import pdb; pdb.set_trace()
+        self._config_socket(socket_handle)
 
-    def _config_socket(self):
-        addr = (BIND_ADDR, BIND_PORT)
-        self._sock = listen(addr, family=socket.AF_INET)
+    def _fromfd(fd, family, type_, proto=0):
+        s = socket.fromfd(fd, family, type_, proto)
+        if s.__class__ is not socket.socket:
+            s = socket.socket(_sock=s)
+        return s
+
+    def _config_socket(self, fromfd=None, family=socket.AF_INET,
+                       type_=socket.SOCK_STREAM):
+        if fromfd:
+            self._sock = self._fromfd(fromfd, family, type_)
+        else:
+            addr = (BIND_ADDR, BIND_PORT)
+            self._sock = listen(addr, family)
 
     def serve(self):
         eventlet.wsgi.server(self._sock, self._app, log=LOG,
@@ -74,14 +159,49 @@ class Server(object):
         else:
             for idx in range(self._worker_count):
                 LOG.info("Starting worker: %s", idx)
-                worker = multiprocessing.Process(target=self.serve)
-                worker.start()
-                self._workers.append(worker)
-            for worker in self._workers:
-                worker.join()
+                rfd, wfd = create_pipe()
 
+                cmd = sys.argv + ['--pipe-handle=%s' % int(rfd)]
+                # Recent setuptools versions will trim '-script.py' and '.exe'
+                # extensions from sys.argv[0].
+                if self._py_script_re.match(sys.argv[0]):
+                    cmd = [sys.executable] + cmd
+                    worker = self._launcher.add_process(cmd)
+                    win32file.CloseHandle(rfd)
+                    # Python 3 makes it easier to share sockets.
+                    handle = None
+                    try:
+                        handle = win32api.OpenProcess(
+                            win32con.PROCESS_ALL_ACCESS, 0, worker.pid)
+                        child_sock_handle = forking.duplicate(
+                            self._sock.fileno(), handle, inheritable=False)
+                    finally:
+                        if handle:
+                            handle.close()
+                    win32file.WriteFile(wfd,
+                                        struct.pack('<I', child_sock_handle))
+
+            self._launcher.wait()
+
+
+def create_pipe(sAttrs=-1, nSize=None):
+    # Default values if parameters are not passed
+    if sAttrs == -1:
+        sAttrs = win32security.SECURITY_ATTRIBUTES()
+        sAttrs.bInheritHandle = 1
+    if nSize is None:
+        # If this parameter is zero, the system uses the default buffer size.
+        nSize = 0
+
+    return win32pipe.CreatePipe(sAttrs, nSize)
 
 if __name__ == '__main__':
     configure_logging()
-    sv = Server(app, WORKER_COUNT)
+
+    if args.pipe_handle:
+        (error, socket_handle) = win32file.ReadFile(int(args.pipe_handle), 4)
+    else:
+        socket_handle = None
+
+    sv = Server(app, WORKER_COUNT, socket_handle)
     sv.start()
