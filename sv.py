@@ -9,7 +9,6 @@ import sys
 import time
 
 import multiprocessing
-from multiprocessing import forking
 from multiprocessing import reduction
 
 import eventlet
@@ -18,26 +17,20 @@ import eventlet.wsgi
 from os_win import utilsfactory as os_win_utilsfactory
 
 # TODO: ditch pywin32
-import ntsecuritycon
-import pywintypes
 import win32api
 import win32con
-import win32event
 import win32file
 import win32pipe
 import win32security
-import winerror
 
 eventlet.monkey_patch(os=False)
-
-# multiprocessing.allow_connection_pickling()
 
 LOG = logging.getLogger()
 
 EVENTLET_DEBUG = False
 BIND_ADDR = "127.0.0.1"
 BIND_PORT = 1234
-WORKER_COUNT = 1
+WORKER_COUNT = 4
 
 parser = argparse.ArgumentParser(
     description='Helper publishing subunit test results.')
@@ -91,7 +84,7 @@ class Win32ProcessLauncher(object):
     def add_process(self, cmd):
         LOG.info("Starting subprocess: %s", cmd)
 
-        worker = subprocess.Popen(cmd)
+        worker = subprocess.Popen(cmd, close_fds=False)
         # import _subprocess
         # _python_exe = os.path.join(sys.exec_prefix, 'python.exe')
         # cmd = ' '.join('"%s"' % x for x in cmd)
@@ -127,15 +120,23 @@ class Win32ProcessLauncher(object):
 class Server(object):
     _py_script_re = re.compile(r'.*\.py\w?$')
 
-    def __init__(self, app, worker_count=0, socket_handle=None):
+    def __init__(self, app, worker_count=0, sock=None):
         self._app = app
         self._worker_count = worker_count
 
         self._launcher = Win32ProcessLauncher()
-        import pdb; pdb.set_trace()
-        self._config_socket(socket_handle)
+        # import pdb; pdb.set_trace()
+        if sock:
+            self._sock = sock
+            # print(sock)
+            # print(dir(sock))
+            # self._sock = self._fromfd(sock.fileno())
+        else:
+            self._config_socket()
 
-    def _fromfd(fd, family, type_, proto=0):
+    def _fromfd(self, fd, family=socket.AF_INET,
+                type_=socket.SOCK_STREAM, proto=0):
+        print(fd)
         s = socket.fromfd(fd, family, type_, proto)
         if s.__class__ is not socket.socket:
             s = socket.socket(_sock=s)
@@ -143,11 +144,8 @@ class Server(object):
 
     def _config_socket(self, fromfd=None, family=socket.AF_INET,
                        type_=socket.SOCK_STREAM):
-        if fromfd:
-            self._sock = self._fromfd(fromfd, family, type_)
-        else:
-            addr = (BIND_ADDR, BIND_PORT)
-            self._sock = listen(addr, family)
+        addr = (BIND_ADDR, BIND_PORT)
+        self._sock = listen(addr, family)
 
     def serve(self):
         eventlet.wsgi.server(self._sock, self._app, log=LOG,
@@ -171,15 +169,16 @@ class Server(object):
                     # Python 3 makes it easier to share sockets.
                     handle = None
                     try:
-                        handle = win32api.OpenProcess(
-                            win32con.PROCESS_ALL_ACCESS, 0, worker.pid)
-                        child_sock_handle = forking.duplicate(
-                            self._sock.fileno(), handle, inheritable=False)
+                        # handle = win32api.OpenProcess(
+                        #     win32con.PROCESS_ALL_ACCESS, 0, worker.pid)
+                        # import pdb; pdb.set_trace()
+                        share_sock_buff = self._sock.share(worker.pid)
                     finally:
                         if handle:
                             handle.close()
                     win32file.WriteFile(wfd,
-                                        struct.pack('<I', child_sock_handle))
+                                        struct.pack('<I', len(share_sock_buff)))
+                    win32file.WriteFile(wfd, share_sock_buff)
 
             self._launcher.wait()
 
@@ -199,9 +198,15 @@ if __name__ == '__main__':
     configure_logging()
 
     if args.pipe_handle:
-        (error, socket_handle) = win32file.ReadFile(int(args.pipe_handle), 4)
+        pipe_handle = int(args.pipe_handle)
+        (error, socket_buff_sz) = win32file.ReadFile(pipe_handle, 4)
+        socket_buff_sz = struct.unpack('<I', socket_buff_sz)[0]
+        (error, socket_buff_data) = win32file.ReadFile(pipe_handle, socket_buff_sz)
+        sock = socket.fromshare(socket_buff_data)
+        worker_count = 0
     else:
-        socket_handle = None
+        sock = None
+        worker_count = WORKER_COUNT
 
-    sv = Server(app, WORKER_COUNT, socket_handle)
+    sv = Server(app, worker_count, sock)
     sv.start()
