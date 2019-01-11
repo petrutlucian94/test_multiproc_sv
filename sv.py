@@ -13,12 +13,6 @@ import eventlet.wsgi
 
 from os_win import utilsfactory as os_win_utilsfactory
 
-# TODO: ditch pywin32
-import win32api
-import win32file
-import win32pipe
-import win32security
-
 eventlet.monkey_patch(os=False)
 
 LOG = logging.getLogger()
@@ -103,6 +97,7 @@ class Server(object):
         self._app = app
         self._worker_count = worker_count
 
+        self._ioutils = os_win_utilsfactory.get_ioutils()
         self._launcher = Win32ProcessLauncher()
 
         if sock:
@@ -125,7 +120,7 @@ class Server(object):
         else:
             for idx in range(self._worker_count):
                 LOG.info("Starting worker: %s", idx)
-                rfd, wfd = create_pipe()
+                rfd, wfd = self._ioutils.create_pipe(inherit_handle=True)
 
                 cmd = sys.argv + ['--pipe-handle=%s' % int(rfd)]
                 # Recent setuptools versions will trim '-script.py' and '.exe'
@@ -133,31 +128,17 @@ class Server(object):
                 if self._py_script_re.match(sys.argv[0]):
                     cmd = [sys.executable] + cmd
                     worker = self._launcher.add_process(cmd)
-                    win32file.CloseHandle(rfd)
-                    # Python 3 makes it easier to share sockets.
-                    handle = None
-                    try:
-                        share_sock_buff = self._sock.share(worker.pid)
-                    finally:
-                        if handle:
-                            handle.close()
-                    win32file.WriteFile(wfd,
-                                        struct.pack('<I', len(share_sock_buff)))
-                    win32file.WriteFile(wfd, share_sock_buff)
+                    self._ioutils.close_handle(rfd)
+
+                    share_sock_buff = self._sock.share(worker.pid)
+                    self._ioutils.write_file(
+                        wfd,
+                        struct.pack('<I', len(share_sock_buff)),
+                        4)
+                    self._ioutils.write_file(
+                        wfd, share_sock_buff, len(share_sock_buff))
 
             self._launcher.wait()
-
-
-def create_pipe(sAttrs=-1, nSize=None):
-    # Default values if parameters are not passed
-    if sAttrs == -1:
-        sAttrs = win32security.SECURITY_ATTRIBUTES()
-        sAttrs.bInheritHandle = 1
-    if nSize is None:
-        # If this parameter is zero, the system uses the default buffer size.
-        nSize = 0
-
-    return win32pipe.CreatePipe(sAttrs, nSize)
 
 
 if __name__ == '__main__':
@@ -165,10 +146,15 @@ if __name__ == '__main__':
 
     if args.pipe_handle:
         pipe_handle = int(args.pipe_handle)
-        (error, socket_buff_sz) = win32file.ReadFile(pipe_handle, 4)
-        socket_buff_sz = struct.unpack('<I', socket_buff_sz)[0]
-        (error, socket_buff_data) = win32file.ReadFile(pipe_handle, socket_buff_sz)
-        sock = socket.fromshare(socket_buff_data)
+        ioutils = os_win_utilsfactory.get_ioutils()
+        buff = ioutils.get_buffer(4)
+        ioutils.read_file(pipe_handle, buff, 4)
+        socket_buff_sz = struct.unpack('<I', buff)[0]
+        socket_buff = ioutils.get_buffer(socket_buff_sz)
+        ioutils.read_file(pipe_handle, socket_buff, socket_buff_sz)
+        ioutils.close_handle(pipe_handle)
+
+        sock = socket.fromshare(bytes(socket_buff[:]))
         worker_count = 0
     else:
         sock = None
